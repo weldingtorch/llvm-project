@@ -1,1 +1,1 @@
-./llvm-project/build/bin/opt -S -load-pass-plugin=./llvm-project/build/lib/Duviz.so --passes=duviz test_ir.ll -o test.ll
+./build/bin/opt -S -load-pass-plugin=./build/lib/Duviz.so --passes=duviz test_ir.ll -o test.ll

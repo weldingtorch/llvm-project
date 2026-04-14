@@ -1,1 +1,1 @@
-ninja -C llvm-project/build/
+ninja -C build/
