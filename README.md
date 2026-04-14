@@ -1,3 +1,38 @@
+# Duviz pass plugin for opt
+
+requirements:
+graphviz library should be installed system-wide
+
+execute in succession
+./0_conf_llvm_build.sh
+./1_build.sh
+to build the repository
+
+./3_test_pass
+will test plugin with ./test.c
+producing graph ./main.png and building ./test with added calls to log_call from llvm/duviz/logger.c
+to dump runtime values into console
+
+
+./2_test_pass
+will test plugin with ./test_ir.ll
+./asd.png, ./bar.png, ./foou.png should be produced
+
+Tooling implementation for the third test may have broken the second test
+by calling log_call too early thus breaking the requirement of phi-nodes
+being at the top most of basic blocks.
+
+That's why I provide two drop-in replacements for llvm/duviz/DefUseViz.cpp
+./___v1DefUseViz.cpp - old version, works with example 2
+to try it just
+mv ./llvm/duviz/DefUseViz.cpp ./
+cp ./___v1DefUseViz.cpp ./llvm/duviz/DefUseViz.cpp
+./1_build.sh && ./2_test_pass
+
+./___v3DefUseViz.cpp - new version, trying to combat phi-node ordering
+yet failing at iterator invalidation
+
+
 # The LLVM Compiler Infrastructure
 
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/llvm/llvm-project/badge)](https://securityscorecards.dev/viewer/?uri=github.com/llvm/llvm-project)
