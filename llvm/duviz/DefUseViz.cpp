@@ -17,10 +17,10 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Plugins/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
-#include <cstddef>
 
 using namespace llvm;
 
+#include <cstddef>
 #include <map>
 #include <vector>
 
@@ -28,33 +28,66 @@ using namespace llvm;
 #include <graphviz/gvc.h>
 
 
-constexpr char LOGGER_FUNC_NAME[] = "log_call";
+namespace {
+    constexpr char LOGGER_FUNC_NAME[] = "log_call";
 
 
-static bool introduceLogger(Module *Module) {
-    Function *LoggerFunc = Module->getFunction(LOGGER_FUNC_NAME);
-    if (LoggerFunc == nullptr) {
-        LLVMContext &Context = Module->getContext();
-        
-        // build function prototype
-        Type *RetType = Type::getVoidTy(Context);
-        Type *NodeType = PointerType::getUnqual(Context);
-        Type *ValueType = Type::getInt32Ty(Context);
+    static bool introduceLogger(Module *Module) {
+        Function *LoggerFunc = Module->getFunction(LOGGER_FUNC_NAME);
+        if (LoggerFunc == nullptr) {
+            LLVMContext &Context = Module->getContext();
+            
+            // build function prototype
+            Type *RetType = Type::getVoidTy(Context);
+            Type *NodeType = PointerType::getUnqual(Context);
+            Type *ValueType = Type::getInt32Ty(Context);
 
-        std::vector<Type*> FuncArgTypes{NodeType, ValueType};
-        FunctionType *Proto = FunctionType::get(RetType, FuncArgTypes, false);
+            std::vector<Type*> FuncArgTypes{NodeType, ValueType};
+            FunctionType *Proto = FunctionType::get(RetType, FuncArgTypes, false);
 
-        // add function to module
-        Module->getOrInsertFunction(LOGGER_FUNC_NAME, Proto);
-        
-        return true;
+            // add function to module
+            Module->getOrInsertFunction(LOGGER_FUNC_NAME, Proto);
+            
+            return true;
+        }
+        return false;
     }
-    return false;
+
+
+    static void instrumentInstruction(Module *Module, IRBuilder<> &Builder, Instruction &Instr, const std::string &StrBuf) {
+        Function *LoggerFunc = Module->getFunction(LOGGER_FUNC_NAME);
+        std::vector<Value *>Args;
+        
+        // add instruction name to args
+        Value *StrPointer = Builder.CreateGlobalString(StrBuf);
+        Args.push_back(StrPointer);
+
+        // add instruction value casted to int32 to args
+        Type *SrcType = Instr.getType();
+        Type *DestType = LoggerFunc->getArg(1)->getType();
+        Value *CastedVal;
+
+        if (SrcType->isPointerTy()) {
+            CastedVal = Builder.CreatePtrToInt(&Instr, DestType);
+        } else if (SrcType->isFloatingPointTy()) {
+            CastedVal = Builder.CreateFPToSI(&Instr, DestType);
+        } else if (SrcType->isIntegerTy() || SrcType->isByteTy()) {
+            CastedVal = Builder.CreateSExtOrTrunc(&Instr, DestType);
+        } else if (SrcType->getPrimitiveSizeInBits() == DestType->getPrimitiveSizeInBits()) {
+            CastedVal = Builder.CreateBitCast(&Instr, DestType);
+        } else if (SrcType->isVoidTy()) {
+            CastedVal = ConstantInt::get(DestType, 0);
+        }
+        Args.push_back(CastedVal);
+
+        // insert call to logger
+        Builder.CreateCall(LoggerFunc, Args);
+    }
 }
 
 
 PreservedAnalyses DefUseViz::run(Function &F,
-                              FunctionAnalysisManager &AM) {
+                            FunctionAnalysisManager &AM) {
     
     if (F.getName() == LOGGER_FUNC_NAME) return PreservedAnalyses::all();
 
@@ -76,16 +109,14 @@ PreservedAnalyses DefUseViz::run(Function &F,
     for (auto *BB: RPOT) {
         outs() << BB->getName() << '\n';
 
-        Agnode_t *PrevNode{nullptr};
-        
         Agraph_t *BasicBlockSubgraph = agsubg(FunctionSubgraph, NULL, true);
         agsafeset(BasicBlockSubgraph, "label", BB->getName().str().c_str(), "");
+        Agnode_t *PrevNode{nullptr};
         
-        // traverse instructions in basic block
-        for (auto it = BB->begin(); it != BB->end();) {
-            auto &Instr = *it;
-            // outs() << Instr << '\n';
-           
+        
+        // add all instructions in basic block to subgraph
+        for (auto &Instr: *BB) {
+            outs() << Instr << '\n';
             
             // add current instruction to BasicBlockSubgraph
             Agnode_t *CurNode = agnode(BasicBlockSubgraph, NULL, true);
@@ -96,58 +127,15 @@ PreservedAnalyses DefUseViz::run(Function &F,
             agset(CurNode, "label", StrBuf.c_str());
             
             agsafeset(CurNode, "shape", "box", "");
-
+            
             // add parent edge
             if (PrevNode != nullptr) {
                 agedge(BasicBlockSubgraph, PrevNode, CurNode, NULL, true);
             }
-
-            // add value logging, except for branching instructions
-            if (!Instr.isTerminator()) {
-                IRBuilder<> Builder(&Instr);
-                // shift build to insert after current instruction
-                Builder.SetInsertPoint(++Builder.GetInsertPoint());
-                
-                Function *LoggerFunc = Module->getFunction(LOGGER_FUNC_NAME);
-                std::vector<Value *>Args;
-                
-                // add instruction name to args
-                Value *StrPointer = Builder.CreateGlobalString(StrBuf);
-                Args.push_back(StrPointer);
-
-                // add instruction value casted to int32 to args
-                Type *SrcType = Instr.getType();
-                Type *DestType = LoggerFunc->getArg(1)->getType();
-                Value *CastedVal;
-
-                if (SrcType->isPointerTy()) {
-                    CastedVal = Builder.CreatePtrToInt(&Instr, DestType);
-                } else if (SrcType->isFloatingPointTy()) {
-                    CastedVal = Builder.CreateFPToSI(&Instr, DestType);
-                } else if (SrcType->isIntegerTy() || SrcType->isByteTy()) {
-                    CastedVal = Builder.CreateSExtOrTrunc(&Instr, DestType);
-                } else if (SrcType->getPrimitiveSizeInBits() == DestType->getPrimitiveSizeInBits()) {
-                    CastedVal = Builder.CreateBitCast(&Instr, DestType);
-                } else if (SrcType->isEmptyTy()) {
-                    CastedVal = ConstantInt::get(DestType, 0);
-                }
-
-                Args.push_back(CastedVal);
-                if (!(SrcType->isEmptyTy())) {
-                    it = Builder.GetInsertPoint(); // update iterator due to invalidation
-                }
-
-
-                // insert call to logger
-                Builder.CreateCall(LoggerFunc, Args);                
-                Modified = true;
-            } else {
-                it++;
-            }
-
+            
             Nodes[&Instr] = CurNode;
             PrevNode = CurNode;
-
+            
             // add use edges
             for (auto &Op: Instr.operands()) {
                 auto NodeIter = Nodes.find(Op);
@@ -156,7 +144,38 @@ PreservedAnalyses DefUseViz::run(Function &F,
                     agsafeset(Edge, "color", "cyan", "");
                 }
             }
+            
+        }
 
+        
+        // add value logging, except for branching instructions
+        IRBuilder<> Builder(BB);
+        Builder.SetInsertPoint(BB->getFirstNonPHIIt());
+        auto InstrIt = BB->begin();
+
+        // "nice" basic blocks start with phis
+        while (InstrIt->getOpcode() == Instruction::PHI) {
+            Instruction &Instr = *InstrIt;
+            ++InstrIt; // next instruction
+            outs() << Instr << ' ' << (long int) &Instr << '\n';
+        
+            const std::string &NodeLabel = agget(Nodes[&Instr], "label");
+            instrumentInstruction(Module, Builder, Instr, NodeLabel);
+            Modified = true;
+        }
+
+        InstrIt = Builder.GetInsertPoint(); // skip phi logging to first non-phi
+        
+        // "nice" basic blocks end with a single terminator 
+        while (!InstrIt->isTerminator()) {
+            Instruction &Instr = *InstrIt;
+            Builder.SetInsertPoint(++Builder.GetInsertPoint()); // move builder to insert after current instruction
+
+            const std::string &NodeLabel = agget(Nodes[&Instr], "label");
+            instrumentInstruction(Module, Builder, Instr, NodeLabel);
+            Modified = true;
+            
+            InstrIt = Builder.GetInsertPoint(); // advance the invalidated it
         }
     }
 
@@ -181,7 +200,7 @@ PreservedAnalyses DefUseViz::run(Function &F,
         }
         
     }
- 
+
     // render function def-use graph to png
     std::string OutFilename = (F.getName() + ".png").str();
     FILE *OutFile = fopen(OutFilename.c_str(), "w");
@@ -196,7 +215,6 @@ PreservedAnalyses DefUseViz::run(Function &F,
     
     return Modified ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
-
 
 extern "C" llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
