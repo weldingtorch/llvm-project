@@ -18,6 +18,8 @@ will test plugin with ./test.c
 producing graph ./main.png and building ./test with added calls to log_call from llvm/duviz/logger.c
 to dump runtime values into console
 
+./4_clear_test_files.sh
+will delete all files created by ./*_test_pass scripts
 
 # The LLVM Compiler Infrastructure
 

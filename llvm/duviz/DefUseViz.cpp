@@ -12,6 +12,7 @@
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -32,10 +33,10 @@ namespace {
     constexpr char LOGGER_FUNC_NAME[] = "log_call";
 
 
-    static bool introduceLogger(Module *Module) {
-        Function *LoggerFunc = Module->getFunction(LOGGER_FUNC_NAME);
+    bool introduceLogger(Module &Module) {
+        Function *LoggerFunc = Module.getFunction(LOGGER_FUNC_NAME);
         if (LoggerFunc == nullptr) {
-            LLVMContext &Context = Module->getContext();
+            LLVMContext &Context = Module.getContext();
             
             // build function prototype
             Type *RetType = Type::getVoidTy(Context);
@@ -46,7 +47,7 @@ namespace {
             FunctionType *Proto = FunctionType::get(RetType, FuncArgTypes, false);
 
             // add function to module
-            Module->getOrInsertFunction(LOGGER_FUNC_NAME, Proto);
+            Module.getOrInsertFunction(LOGGER_FUNC_NAME, Proto);
             
             return true;
         }
@@ -54,8 +55,8 @@ namespace {
     }
 
 
-    static void instrumentInstruction(Module *Module, IRBuilder<> &Builder, Instruction &Instr, const std::string &StrBuf) {
-        Function *LoggerFunc = Module->getFunction(LOGGER_FUNC_NAME);
+    void instrumentInstruction(Module &Module, IRBuilder<> &Builder, Instruction &Instr, const std::string &StrBuf) {
+        Function *LoggerFunc = Module.getFunction(LOGGER_FUNC_NAME);
         std::vector<Value *>Args;
         
         // add instruction name to args
@@ -83,126 +84,141 @@ namespace {
         // insert call to logger
         Builder.CreateCall(LoggerFunc, Args);
     }
-}
 
 
-PreservedAnalyses DefUseViz::run(Function &F,
-                            FunctionAnalysisManager &AM) {
-    
-    if (F.getName() == LOGGER_FUNC_NAME) return PreservedAnalyses::all();
+    bool processFunction(Module &M, Function &F, Agraph_t *ModuleGraph, std::map<Value *, Agnode_t *> &Nodes) {
+        bool Modified{};
 
-    GVC_t *Gvc = gvContext();
-    Agraph_t *Graph = agopen(NULL, Agdirected, NULL);
-    Agraph_t *FunctionSubgraph = agsubg(Graph, NULL, true);
-    agsafeset(FunctionSubgraph, "cluster", "true", "true");
-    agsafeset(FunctionSubgraph, "label", F.getName().data(), "");
-    agsafeset(FunctionSubgraph, "newrank", "", "true");
+        Agraph_t *FunctionSubgraph = agsubg(ModuleGraph, NULL, true);
+        agsafeset(FunctionSubgraph, "label", F.getName().data(), "");
 
-    std::map<Value *, Agnode_t *> Nodes;
-    
-    Module *Module = F.getParent();
-    bool Modified{introduceLogger(Module)};
 
-    ReversePostOrderTraversal<Function *> RPOT(&F);
+        ReversePostOrderTraversal<Function *> RPOT(&F);
 
-    // build separately all basic blocks subgraphs
-    for (auto *BB: RPOT) {
-        outs() << BB->getName() << '\n';
+        // build separately all basic blocks subgraphs
+        for (auto *BB: RPOT) {
+            outs() << BB->getName() << '\n';
 
-        Agraph_t *BasicBlockSubgraph = agsubg(FunctionSubgraph, NULL, true);
-        agsafeset(BasicBlockSubgraph, "label", BB->getName().str().c_str(), "");
-        Agnode_t *PrevNode{nullptr};
-        
-        
-        // add all instructions in basic block to subgraph
-        for (auto &Instr: *BB) {
-            outs() << Instr << '\n';
+            Agraph_t *BasicBlockSubgraph = agsubg(FunctionSubgraph, NULL, true);
+            agsafeset(BasicBlockSubgraph, "label", BB->getName().str().c_str(), "");
+            Agnode_t *PrevNode{nullptr};
             
-            // add current instruction to BasicBlockSubgraph
-            Agnode_t *CurNode = agnode(BasicBlockSubgraph, NULL, true);
             
-            std::string StrBuf;
-            llvm::raw_string_ostream Operation(StrBuf);
-            Operation << Instr;
-            agset(CurNode, "label", StrBuf.c_str());
-            
-            agsafeset(CurNode, "shape", "box", "");
-            
-            // add parent edge
-            if (PrevNode != nullptr) {
-                agedge(BasicBlockSubgraph, PrevNode, CurNode, NULL, true);
+            // add all instructions in basic block to subgraph
+            for (auto &Instr: *BB) {
+                outs() << Instr << '\n';
+                
+                // add current instruction to BasicBlockSubgraph
+                Agnode_t *CurNode = agnode(BasicBlockSubgraph, NULL, true);
+                
+                std::string StrBuf;
+                llvm::raw_string_ostream Operation(StrBuf);
+                Operation << Instr;
+                agset(CurNode, "label", StrBuf.c_str());
+                
+                agsafeset(CurNode, "shape", "box", "");
+                
+                // add parent edge
+                if (PrevNode != nullptr) {
+                    agedge(BasicBlockSubgraph, PrevNode, CurNode, NULL, true);
+                }
+                
+                Nodes[&Instr] = CurNode;
+                PrevNode = CurNode;
+                
+                // add use edges
+                for (auto &Op: Instr.operands()) {
+                    auto NodeIter = Nodes.find(Op);
+                    if (NodeIter != Nodes.end()) {
+                        Agedge_t *Edge = agedge(BasicBlockSubgraph, CurNode, NodeIter->second, NULL, 1);
+                        agsafeset(Edge, "color", "cyan", "");
+                    }
+                }
+                
             }
+
             
-            Nodes[&Instr] = CurNode;
-            PrevNode = CurNode;
+            // add value logging, except for branching instructions
+            IRBuilder<> Builder(BB);
+            Builder.SetInsertPoint(BB->getFirstNonPHIIt());
+            auto InstrIt = BB->begin();
+
+            // "nice" basic blocks start with phis
+            while (InstrIt->getOpcode() == Instruction::PHI) {
+                Instruction &Instr = *InstrIt;
+                ++InstrIt; // next instruction
             
-            // add use edges
-            for (auto &Op: Instr.operands()) {
-                auto NodeIter = Nodes.find(Op);
-                if (NodeIter != Nodes.end()) {
-                    Agedge_t *Edge = agedge(BasicBlockSubgraph, CurNode, NodeIter->second, NULL, 1);
-                    agsafeset(Edge, "color", "cyan", "");
+                const std::string &NodeLabel = agget(Nodes[&Instr], "label");
+                instrumentInstruction(M, Builder, Instr, NodeLabel);
+                Modified = true;
+            }
+
+            InstrIt = Builder.GetInsertPoint(); // skip phi logging to first non-phi
+            
+            // "nice" basic blocks end with a single terminator 
+            while (!InstrIt->isTerminator()) {
+                Instruction &Instr = *InstrIt;
+                Builder.SetInsertPoint(++Builder.GetInsertPoint()); // move builder to insert after current instruction
+
+                const std::string &NodeLabel = agget(Nodes[&Instr], "label");
+                instrumentInstruction(M, Builder, Instr, NodeLabel);
+                Modified = true;
+                
+                InstrIt = Builder.GetInsertPoint(); // advance the invalidated it
+            }
+        }
+
+        // connect basic block subgraphs by adding branch edges
+        for (auto &BB: F) {
+            Instruction *Term = BB.getTerminator();
+            
+            if (Term->getOpcode() == Instruction::CondBr) {
+                auto It = Term->successors().begin();
+                
+                Agedge_t *EdgeIfTrue = agedge(FunctionSubgraph, Nodes[Term], Nodes[&It->front()], NULL, 1);
+                agsafeset(EdgeIfTrue, "color", "green", "");
+                It++;
+                
+                Agedge_t *EdgeIfFalse = agedge(FunctionSubgraph, Nodes[Term], Nodes[&It->front()], NULL, 1);
+                agsafeset(EdgeIfFalse, "color", "red", "");
+            } else {
+                for (auto *Succ: Term->successors()) {
+                    Agedge_t *Edge = agedge(FunctionSubgraph, Nodes[Term], Nodes[&Succ->front()], NULL, 1);
+                    agsafeset(Edge, "color", "gray", "");
                 }
             }
             
         }
 
-        
-        // add value logging, except for branching instructions
-        IRBuilder<> Builder(BB);
-        Builder.SetInsertPoint(BB->getFirstNonPHIIt());
-        auto InstrIt = BB->begin();
+        return Modified;
+    }
+} // namespace
 
-        // "nice" basic blocks start with phis
-        while (InstrIt->getOpcode() == Instruction::PHI) {
-            Instruction &Instr = *InstrIt;
-            ++InstrIt; // next instruction
-            outs() << Instr << ' ' << (long int) &Instr << '\n';
-        
-            const std::string &NodeLabel = agget(Nodes[&Instr], "label");
-            instrumentInstruction(Module, Builder, Instr, NodeLabel);
-            Modified = true;
-        }
 
-        InstrIt = Builder.GetInsertPoint(); // skip phi logging to first non-phi
+PreservedAnalyses DefUseViz::run(Module &M,
+                            ModuleAnalysisManager &MAM) {
+    
+    GVC_t *Gvc = gvContext();
+    Agraph_t *Graph = agopen(NULL, Agdirected, NULL);
+    
+    Agraph_t *ModuleSubgraph = agsubg(Graph, NULL, true);
+    agsafeset(ModuleSubgraph, "cluster", "true", "true");
+    agsafeset(ModuleSubgraph, "label", M.getName().data(), "");
+    agsafeset(ModuleSubgraph, "newrank", "", "true");
+    
+    std::map<Value *, Agnode_t *> Nodes;
+    
+    bool Modified{introduceLogger(M)};
         
-        // "nice" basic blocks end with a single terminator 
-        while (!InstrIt->isTerminator()) {
-            Instruction &Instr = *InstrIt;
-            Builder.SetInsertPoint(++Builder.GetInsertPoint()); // move builder to insert after current instruction
+    for (auto &F: M) {
+        if (F.empty())
+            continue;
 
-            const std::string &NodeLabel = agget(Nodes[&Instr], "label");
-            instrumentInstruction(Module, Builder, Instr, NodeLabel);
-            Modified = true;
-            
-            InstrIt = Builder.GetInsertPoint(); // advance the invalidated it
-        }
+        Modified |= processFunction(M, F, ModuleSubgraph, Nodes);
     }
 
-    // connect basic block subgraphs by adding branch edges
-    for (auto &BB: F) {
-        Instruction *Term = BB.getTerminator();
-        
-        if (Term->getOpcode() == Instruction::CondBr) {
-            auto It = Term->successors().begin();
-            
-            Agedge_t *EdgeIfTrue = agedge(FunctionSubgraph, Nodes[Term], Nodes[&It->front()], NULL, 1);
-            agsafeset(EdgeIfTrue, "color", "green", "");
-            It++;
-            
-            Agedge_t *EdgeIfFalse = agedge(FunctionSubgraph, Nodes[Term], Nodes[&It->front()], NULL, 1);
-            agsafeset(EdgeIfFalse, "color", "red", "");
-        } else {
-            for (auto *Succ: Term->successors()) {
-                Agedge_t *Edge = agedge(FunctionSubgraph, Nodes[Term], Nodes[&Succ->front()], NULL, 1);
-                agsafeset(Edge, "color", "gray", "");
-            }
-        }
-        
-    }
-
-    // render function def-use graph to png
-    std::string OutFilename = (F.getName() + ".png").str();
+    // render module def-use graph to png
+    std::string OutFilename = (M.getName() + ".png").str();
     FILE *OutFile = fopen(OutFilename.c_str(), "w");
     if (OutFile) {
         gvLayout(Gvc, Graph, "dot");
@@ -212,19 +228,20 @@ PreservedAnalyses DefUseViz::run(Function &F,
     fclose(OutFile);
     agclose(Graph);
     gvFreeContext(Gvc);
-    
+
     return Modified ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
+    
 
 extern "C" llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
-  return {LLVM_PLUGIN_API_VERSION, "BinShiftPass", "1.0",
+  return {LLVM_PLUGIN_API_VERSION, "DefUseVizPass", "1.0",
           [](llvm::PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
-                [](llvm::StringRef Name, llvm::FunctionPassManager &FPM,
+                [](llvm::StringRef Name, llvm::ModulePassManager &MPM,
                    llvm::ArrayRef<llvm::PassBuilder::PipelineElement>) {
                   if (Name == "duviz") {
-                    FPM.addPass(DefUseViz());
+                    MPM.addPass(DefUseViz());
                     return true;
                   }
                   return false;

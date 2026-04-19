@@ -4,7 +4,7 @@ namespace llvm {
 
 class DefUseViz : public PassInfoMixin<DefUseViz> {
 public:
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
   
   static bool isRequired() { return true; }
 };
