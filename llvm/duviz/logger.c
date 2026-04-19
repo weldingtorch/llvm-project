@@ -9,7 +9,6 @@
 #define MAX_VALUE_LENGTH 11
 #define NEW_FILENAME_PREFIX "new_"
 #define VALUE_PREFIX "VALUE="
-#define PLACEHOLDER_VALUE_LEN 1
 
 
 void log_call(const char *Filename, uint64_t NodeId, int32_t Value) {
@@ -31,7 +30,7 @@ void log_call(const char *Filename, uint64_t NodeId, int32_t Value) {
         Agnode_t *Node = agidnode(Graph, NodeId, false);
         const char *NodeLabel = agget(Node, "label");
         
-        char *NewNodeLabel = malloc(strlen(NodeLabel) + MAX_VALUE_LENGTH - PLACEHOLDER_VALUE_LEN);
+        char *NewNodeLabel = malloc(strlen(NodeLabel) + MAX_VALUE_LENGTH);
         if (NewNodeLabel != NULL) {
             // find where "VALUE=" starts
             size_t ValueOffset = strstr(NodeLabel, VALUE_PREFIX) - NodeLabel + (sizeof(VALUE_PREFIX) - 1);
@@ -41,7 +40,8 @@ void log_call(const char *Filename, uint64_t NodeId, int32_t Value) {
             NewNodeLabel[ValueOffset] = 0; // set c-style string end
             // write value as int after "="
             sprintf(NewNodeLabel + ValueOffset, "%d", Value);
-            ValueOffset += PLACEHOLDER_VALUE_LEN; // skip initial placeholder
+            // find where old value ends
+            ValueOffset += strchr(NodeLabel + ValueOffset, '<') - (NodeLabel + ValueOffset);
             // copy everything after "="
             strcat(NewNodeLabel, NodeLabel + ValueOffset);
 
