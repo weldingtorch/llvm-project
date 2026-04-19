@@ -1,24 +1,28 @@
 # Duviz pass plugin for opt
 
-requirements:
-graphviz library should be installed system-wide
+requirements:\
+`graphviz` library should be installed system-wide
 
-execute in succession
-./0_conf_llvm_build.sh
-./1_build.sh
+execute in succession\
+`./0_conf_llvm_build.sh`\
+`./1_build.sh`\
 to build the repository
 
-./2_test_pass
-will test plugin with ./test_ir.ll
-function graphs ./asd.png, ./bar.png, ./foou.png should be produced
-as well as ./test_ir_instrumented.ll
+`./2_test_pass`\
+will test plugin with ./test_ir.ll as input and produce ./test_ir_instrumented.ll\
+as well as module graph ./test_ir.ll.dot,\
+which can be rendered to png with\
+`dot -Tpng test_ir.ll.dot -o test_ir.ll.png`
 
-./3_test_pass
-will test plugin with ./test.c
-producing graph ./main.png and building ./test with added calls to log_call from llvm/duviz/logger.c
-to dump runtime values into console
+`./3_test_pass`\
+will test plugin with ./test.c as input and produce instrumented executable ./test\
+and ./test_c_ir.ll.dot\
+./test has added calls to log_call from llvm/duviz/logger.c to dump runtime values,\
+so after executing ./test graph ./test_c_ir.ll.dot will be populated with values.\
+The resulting graph can be rendered to png with\
+`dot -Tpng test_c_ir.ll.dot -o test_c_ir.ll.png`
 
-./4_clear_test_files.sh
+`./4_clear_test_files.sh`\
 will delete all files created by ./*_test_pass scripts
 
 # The LLVM Compiler Infrastructure

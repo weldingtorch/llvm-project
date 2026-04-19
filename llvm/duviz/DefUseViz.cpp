@@ -8,11 +8,13 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Pass.h"
 #include "llvm/Passes/PassBuilder.h"
@@ -23,7 +25,7 @@ using namespace llvm;
 
 #include <cstddef>
 #include <map>
-#include <vector>
+#include <string>
 
 #include <graphviz/cgraph.h>
 #include <graphviz/gvc.h>
@@ -31,41 +33,40 @@ using namespace llvm;
 
 namespace {
     constexpr char LOGGER_FUNC_NAME[] = "log_call";
-
-
-    bool introduceLogger(Module &Module) {
-        Function *LoggerFunc = Module.getFunction(LOGGER_FUNC_NAME);
+    
+    
+    bool introduceLogger(Module &M) {
+        Function *LoggerFunc = M.getFunction(LOGGER_FUNC_NAME);
         if (LoggerFunc == nullptr) {
-            LLVMContext &Context = Module.getContext();
+            LLVMContext &Context = M.getContext();
             
             // build function prototype
             Type *RetType = Type::getVoidTy(Context);
-            Type *NodeType = PointerType::getUnqual(Context);
+            Type *FilenameType = PointerType::getUnqual(Context);
+            Type *NodeIdType = Type::getInt64Ty(Context);
             Type *ValueType = Type::getInt32Ty(Context);
 
-            std::vector<Type*> FuncArgTypes{NodeType, ValueType};
+            Type* FuncArgTypes[] {FilenameType, NodeIdType, ValueType};
             FunctionType *Proto = FunctionType::get(RetType, FuncArgTypes, false);
 
             // add function to module
-            Module.getOrInsertFunction(LOGGER_FUNC_NAME, Proto);
-            
+            M.getOrInsertFunction(LOGGER_FUNC_NAME, Proto);
             return true;
         }
         return false;
     }
-
-
-    void instrumentInstruction(Module &Module, IRBuilder<> &Builder, Instruction &Instr, const std::string &StrBuf) {
+    
+    
+    void instrumentInstruction(Module &Module, IRBuilder<> &Builder, Instruction &Instr, Agnode_t *Node, Value *OutFilename) {
         Function *LoggerFunc = Module.getFunction(LOGGER_FUNC_NAME);
-        std::vector<Value *>Args;
         
-        // add instruction name to args
-        Value *StrPointer = Builder.CreateGlobalString(StrBuf);
-        Args.push_back(StrPointer);
+        // create node id arg
+        IDTYPE NodeId = AGID(Node);
+        Value * NodeIdArg = ConstantInt::get(LoggerFunc->getArg(1)->getType(), NodeId);
 
-        // add instruction value casted to int32 to args
+        // create instruction value casted to int32 arg
         Type *SrcType = Instr.getType();
-        Type *DestType = LoggerFunc->getArg(1)->getType();
+        Type *DestType = LoggerFunc->getArg(2)->getType();
         Value *CastedVal;
 
         if (SrcType->isPointerTy()) {
@@ -76,17 +77,17 @@ namespace {
             CastedVal = Builder.CreateSExtOrTrunc(&Instr, DestType);
         } else if (SrcType->getPrimitiveSizeInBits() == DestType->getPrimitiveSizeInBits()) {
             CastedVal = Builder.CreateBitCast(&Instr, DestType);
-        } else if (SrcType->isVoidTy()) {
+        } else {
             CastedVal = ConstantInt::get(DestType, 0);
         }
-        Args.push_back(CastedVal);
 
         // insert call to logger
+        Value *Args[] = {OutFilename, NodeIdArg, CastedVal};
         Builder.CreateCall(LoggerFunc, Args);
     }
-
-
-    bool processFunction(Module &M, Function &F, Agraph_t *ModuleGraph, std::map<Value *, Agnode_t *> &Nodes) {
+    
+    
+    bool processFunction(Module &M, Function &F, IRBuilder<> &Builder, Agraph_t *ModuleGraph, std::map<Value *, Agnode_t *> &Nodes, Value *OutFilenameVal) {
         bool Modified{};
 
         Agraph_t *FunctionSubgraph = agsubg(ModuleGraph, NULL, true);
@@ -97,8 +98,6 @@ namespace {
 
         // build separately all basic blocks subgraphs
         for (auto *BB: RPOT) {
-            outs() << BB->getName() << '\n';
-
             Agraph_t *BasicBlockSubgraph = agsubg(FunctionSubgraph, NULL, true);
             agsafeset(BasicBlockSubgraph, "label", BB->getName().str().c_str(), "");
             Agnode_t *PrevNode{nullptr};
@@ -106,17 +105,19 @@ namespace {
             
             // add all instructions in basic block to subgraph
             for (auto &Instr: *BB) {
-                outs() << Instr << '\n';
-                
                 // add current instruction to BasicBlockSubgraph
                 Agnode_t *CurNode = agnode(BasicBlockSubgraph, NULL, true);
                 
-                std::string StrBuf;
+                std::string StrBuf = "<TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\"><TR><TD>";
                 llvm::raw_string_ostream Operation(StrBuf);
                 Operation << Instr;
-                agset(CurNode, "label", StrBuf.c_str());
+                Operation << "</TD><TD>VALUE=0</TD></TR></TABLE>";
                 
-                agsafeset(CurNode, "shape", "box", "");
+                char* NodeLabel = agstrdup_html(BasicBlockSubgraph, StrBuf.c_str());
+                agset(CurNode, "label", NodeLabel);
+                agstrfree(BasicBlockSubgraph, NodeLabel, true);
+                
+                agsafeset(CurNode, "shape", "plaintext", "");
                 
                 // add parent edge
                 if (PrevNode != nullptr) {
@@ -134,34 +135,30 @@ namespace {
                         agsafeset(Edge, "color", "cyan", "");
                     }
                 }
-                
             }
-
+            
             
             // add value logging, except for branching instructions
-            IRBuilder<> Builder(BB);
             Builder.SetInsertPoint(BB->getFirstNonPHIIt());
             auto InstrIt = BB->begin();
-
+            
             // "nice" basic blocks start with phis
             while (InstrIt->getOpcode() == Instruction::PHI) {
                 Instruction &Instr = *InstrIt;
                 ++InstrIt; // next instruction
-            
-                const std::string &NodeLabel = agget(Nodes[&Instr], "label");
-                instrumentInstruction(M, Builder, Instr, NodeLabel);
+                
+                instrumentInstruction(M, Builder, Instr, Nodes[&Instr], OutFilenameVal);
                 Modified = true;
             }
-
+            
             InstrIt = Builder.GetInsertPoint(); // skip phi logging to first non-phi
             
             // "nice" basic blocks end with a single terminator 
             while (!InstrIt->isTerminator()) {
                 Instruction &Instr = *InstrIt;
                 Builder.SetInsertPoint(++Builder.GetInsertPoint()); // move builder to insert after current instruction
-
-                const std::string &NodeLabel = agget(Nodes[&Instr], "label");
-                instrumentInstruction(M, Builder, Instr, NodeLabel);
+                
+                instrumentInstruction(M, Builder, Instr, Nodes[&Instr], OutFilenameVal);
                 Modified = true;
                 
                 InstrIt = Builder.GetInsertPoint(); // advance the invalidated it
@@ -187,7 +184,6 @@ namespace {
                     agsafeset(Edge, "color", "gray", "");
                 }
             }
-            
         }
 
         return Modified;
@@ -206,23 +202,25 @@ PreservedAnalyses DefUseViz::run(Module &M,
     agsafeset(ModuleSubgraph, "label", M.getName().data(), "");
     agsafeset(ModuleSubgraph, "newrank", "", "true");
     
+    std::string OutFilename = (M.getName() + ".dot").str();
     std::map<Value *, Agnode_t *> Nodes;
     
     bool Modified{introduceLogger(M)};
-        
+    IRBuilder<> Builder(M.getContext());
+    Value *OutFilenameVal = Builder.CreateGlobalString(OutFilename, "" , 0, &M);
+    
     for (auto &F: M) {
         if (F.empty())
             continue;
-
-        Modified |= processFunction(M, F, ModuleSubgraph, Nodes);
+        
+        Modified |= processFunction(M, F, Builder, ModuleSubgraph, Nodes, OutFilenameVal);
     }
 
     // render module def-use graph to png
-    std::string OutFilename = (M.getName() + ".png").str();
     FILE *OutFile = fopen(OutFilename.c_str(), "w");
     if (OutFile) {
         gvLayout(Gvc, Graph, "dot");
-        gvRender(Gvc, Graph, "png", OutFile);
+        gvRender(Gvc, Graph, "dot", OutFile);
         gvFreeLayout(Gvc, Graph);
     }
     fclose(OutFile);
@@ -231,7 +229,7 @@ PreservedAnalyses DefUseViz::run(Module &M,
 
     return Modified ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
-    
+
 
 extern "C" llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
